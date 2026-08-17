@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # GitHub macOS runners are VMs and have no Secure Enclave access, so CI
+    # exercises the software P-256 backend only. Enclave paths are verified on
+    # real hardware via `gpg-sep doctor --hardware`.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GnuPG
+        run: brew install gnupg || brew upgrade gnupg || true
+      - name: Swift version
+        run: swift --version && gpg --version | head -2
+      - name: Build
+        run: swift build 2>&1 | tail -20
+      - name: Test
+        run: swift test 2>&1 | tail -50

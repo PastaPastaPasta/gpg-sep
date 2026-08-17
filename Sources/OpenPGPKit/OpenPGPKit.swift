@@ -1,0 +1,1 @@
+// OpenPGPKit — implementation forthcoming.
