@@ -24,26 +24,28 @@ struct CLIContext {
 
 /// Small parsing helpers over `gpg --with-colons` listings.
 enum GpgKeyring {
+    /// The uppercase keygrips from every `grp:` line of a `--with-keygrip` colon
+    /// listing, in order (the primary's grip comes first).
+    private static func keygrips(inColonListing listing: String) -> [String] {
+        var grips: [String] = []
+        for line in listing.split(separator: "\n") where line.hasPrefix("grp:") {
+            let fields = line.split(separator: ":", omittingEmptySubsequences: false)
+            if fields.count > 9 { grips.append(String(fields[9]).uppercased()) }
+        }
+        return grips
+    }
+
     /// The primary key's keygrip (uppercase hex) for `fpr`, from
     /// `--with-keygrip --list-keys`. Returns the first `grp:` line (the primary).
     static func primaryKeygrip(fpr: String) -> String? {
         let listing = Tools.gpgRun(["--with-colons", "--with-keygrip", "--list-keys", fpr]).outString
-        for line in listing.split(separator: "\n") where line.hasPrefix("grp:") {
-            let fields = line.split(separator: ":", omittingEmptySubsequences: false)
-            if fields.count > 9 { return String(fields[9]).uppercased() }
-        }
-        return nil
+        return keygrips(inColonListing: listing).first
     }
 
     /// All keygrips (uppercase) visible in the public keyring.
     static func visibleKeygrips() -> Set<String> {
         let listing = Tools.gpgRun(["--with-colons", "--with-keygrip", "--list-keys"]).outString
-        var grips = Set<String>()
-        for line in listing.split(separator: "\n") where line.hasPrefix("grp:") {
-            let fields = line.split(separator: ":", omittingEmptySubsequences: false)
-            if fields.count > 9 { grips.insert(String(fields[9]).uppercased()) }
-        }
-        return grips
+        return Set(keygrips(inColonListing: listing))
     }
 
     /// Whether a key with `fpr` exists in the public keyring.

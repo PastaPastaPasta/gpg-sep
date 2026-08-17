@@ -165,11 +165,9 @@ enum UninstallCommand {
         // autostarts the stock agent on the standard path again.
         let socket = Tools.agentSocket()
         let status = DoctorCommand.socketStatus(socketPath: socket, waitSeconds: 0)
-        if status.isOurs || status.exists {
-            if status.isOurs {
-                try? FileManager.default.removeItem(atPath: socket)
-                changes.append("removed our socket at \(socket)")
-            }
+        if status.isOurs {
+            try? FileManager.default.removeItem(atPath: socket)
+            changes.append("removed our socket at \(socket)")
         }
         let backendHome = BackendAgent.defaultBackendHome()
         if FileManager.default.fileExists(atPath: backendHome.path) {

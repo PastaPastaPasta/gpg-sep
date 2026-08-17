@@ -198,7 +198,7 @@ enum DoctorCommand {
         for r in records {
             let expected = PGPPublicKeyPacket(
                 creationTime: r.creationTime,
-                algorithm: r.role == .signing ? .ecdsa : .ecdh,
+                algorithm: algorithm(for: r.role),
                 point: r.point).keygrip.hexUpperString
             if expected != r.keygripHex.uppercased() {
                 problems.append("\(r.keygripHex): keygrip does not match the stored point")
