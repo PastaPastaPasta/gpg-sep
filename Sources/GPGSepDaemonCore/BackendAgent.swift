@@ -33,8 +33,15 @@ public final class BackendAgent {
         "sshcontrol",
         "scdaemon.conf",
         "pubring.kbx",
+        "pubring.db",     // keyboxd public keyring (gpg 2.4+)
+        "common.conf",    // shared gpg/keyboxd config (e.g. use-keyboxd)
         "trustdb.gpg",
     ]
+
+    /// Entries that MUST exist as a shared store: if the real home lacks one, we
+    /// create it there and link to it, so the backend agent can never quietly
+    /// create its own private copy that strands secret keys in the backend home.
+    private static let sharedDirsToCreate = ["private-keys-v1.d"]
 
     /// Test / advanced use: forward to an agent already listening at
     /// `socketPath`; ``start()`` and ``stop()`` are no-ops.
@@ -91,6 +98,19 @@ public final class BackendAgent {
             at: backendHome, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
 
+        // Make sure the shared secret-key store exists in the REAL home before we
+        // link to it. Otherwise the link target is missing, the backend agent
+        // creates `private-keys-v1.d` inside its own home, and any key generated
+        // through it is stranded there instead of landing in the user's keyring.
+        for dir in Self.sharedDirsToCreate {
+            let source = realGnupgHome.appendingPathComponent(dir)
+            if !FileManager.default.fileExists(atPath: source.path) {
+                try FileManager.default.createDirectory(
+                    at: source, withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700])
+            }
+        }
+
         for entry in Self.linkedEntries {
             let source = realGnupgHome.appendingPathComponent(entry)
             let dest = backendHome.appendingPathComponent(entry)
@@ -118,6 +138,32 @@ public final class BackendAgent {
             usleep(50_000)
         }
         throw BackendError("backend gpg-agent socket never appeared at \(discovered)")
+    }
+
+    /// Ensure a backend agent is reachable, restarting it if its socket is gone
+    /// or not answering. Bounded so a persistently-broken backend never blocks a
+    /// caller forever. No-op for the injected-socket case (nothing to manage) —
+    /// there the caller simply serves in decoupled mode if the socket is dead.
+    ///
+    /// Idempotent and cheap on the happy path: a single liveness probe returns
+    /// immediately when the agent is already up.
+    public func ensureRunning(retries: Int = 2) {
+        guard managesLifecycle else { return }
+        for attempt in 0...max(retries, 0) {
+            if let socket = socketPath, Self.socketIsLive(socket) { return }
+            _ = try? start()
+            if let socket = socketPath, Self.socketIsLive(socket) { return }
+            if attempt < retries { usleep(100_000) }
+        }
+    }
+
+    /// True when something answers an Assuan connect at `path`.
+    private static func socketIsLive(_ path: String) -> Bool {
+        var st = stat()
+        guard lstat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFSOCK else { return false }
+        guard let conn = try? AssuanConnection.connect(toUnixSocket: path) else { return false }
+        conn.close()
+        return true
     }
 
     /// Stop the managed backend agent. No-op for the injected-socket case.

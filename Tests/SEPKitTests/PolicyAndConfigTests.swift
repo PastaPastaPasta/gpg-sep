@@ -62,28 +62,30 @@ final class PolicyAndConfigTests: XCTestCase {
 
     // MARK: AuthSession grace window
 
-    func testAuthSessionReusesSharedContextWithinGrace() {
+    private static let sampleGrip = String(repeating: "C", count: 40)
+
+    func testAuthSessionReusesContextForOneKeyWithinGrace() {
         let session = AuthSession(defaultGraceSeconds: 15)
-        let a = session.context()
-        let b = session.context()
-        XCTAssertTrue(a === b, "within the grace window the same LAContext is reused")
+        let a = session.context(forKeygrip: Self.sampleGrip)
+        let b = session.context(forKeygrip: Self.sampleGrip)
+        XCTAssertTrue(a === b, "within the grace window the same key reuses one LAContext")
         XCTAssertEqual(a.touchIDAuthenticationAllowableReuseDuration, 15)
     }
 
     func testAuthSessionZeroGraceForcesFreshContext() {
         let session = AuthSession(defaultGraceSeconds: 15)
         // A per-key override of 0 must force a brand-new context each call.
-        let a = session.context(graceSeconds: 0)
-        let b = session.context(graceSeconds: 0)
+        let a = session.context(forKeygrip: Self.sampleGrip, graceSeconds: 0)
+        let b = session.context(forKeygrip: Self.sampleGrip, graceSeconds: 0)
         XCTAssertFalse(a === b, "graceSeconds 0 must force per-signature auth (fresh context)")
         XCTAssertEqual(a.touchIDAuthenticationAllowableReuseDuration, 0)
     }
 
-    func testAuthSessionInvalidateDropsSharedContext() {
+    func testAuthSessionInvalidateDropsCachedContext() {
         let session = AuthSession(defaultGraceSeconds: 15)
-        let a = session.context()
+        let a = session.context(forKeygrip: Self.sampleGrip)
         session.invalidate()
-        let b = session.context()
+        let b = session.context(forKeygrip: Self.sampleGrip)
         XCTAssertFalse(a === b, "after invalidate a fresh context is issued")
     }
 

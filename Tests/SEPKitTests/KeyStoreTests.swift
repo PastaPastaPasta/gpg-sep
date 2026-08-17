@@ -103,6 +103,63 @@ final class KeyStoreTests: XCTestCase {
         XCTAssertEqual(KeyStore.defaultRoot().path, root.path)
     }
 
+    // MARK: - H1: keygrip validation / path-traversal defense
+
+    func testNormalizedKeygripAcceptsOnly40Hex() {
+        XCTAssertNil(KeyStore.normalizedKeygrip("../../foo"))
+        XCTAssertNil(KeyStore.normalizedKeygrip("../EVIL"))
+        XCTAssertNil(KeyStore.normalizedKeygrip("xyz"))
+        XCTAssertNil(KeyStore.normalizedKeygrip(String(repeating: "a", count: 39))) // short
+        XCTAssertNil(KeyStore.normalizedKeygrip(String(repeating: "a", count: 41))) // long
+        XCTAssertNil(KeyStore.normalizedKeygrip("")) // empty
+        let good = String(repeating: "aB0", count: 13) + "a" // 40 hex, mixed case
+        XCTAssertEqual(KeyStore.normalizedKeygrip(good), good.uppercased())
+    }
+
+    /// Reproduces the reviewer's planted-record attack: a foreign, perfectly
+    /// valid record placed OUTSIDE the keys directory must never be reachable via
+    /// a traversal keygrip, and must never be used to sign.
+    func testTraversalKeygripCannotLoadOrSignOutOfStoreRecord() throws {
+        let store = KeyStore(root: root)
+        // A legitimate key, both to create the keys dir and to clone as bait.
+        let legit = try store.generateSigningKey(
+            policy: KeyPolicy(presence: .none, graceSeconds: 0),
+            label: "legit", creationTime: 1_700_000_000, forceSoftware: true)
+
+        // Plant that record one level ABOVE keys/, at <root>/EVIL.json, which the
+        // pre-fix `recordURL` would have resolved for the grip "../EVIL".
+        let planted = root.appendingPathComponent("EVIL.json")
+        let legitURL = root.appendingPathComponent("keys/\(legit.keygripHex).json")
+        try FileManager.default.copyItem(at: legitURL, to: planted)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: planted.path))
+
+        // The malformed grip is rejected at the store boundary: no load, no sign.
+        XCTAssertNil(try store.record(keygripHex: "../EVIL"))
+        XCTAssertNil(try store.record(keygripHex: "../../foo"))
+        XCTAssertThrowsError(try store.signingBackend(keygripHex: "../EVIL", context: nil)) { error in
+            guard case SEPError.keyNotFound = error else {
+                return XCTFail("expected keyNotFound for a traversal grip, got \(error)")
+            }
+        }
+    }
+
+    // MARK: - LOW: corrupt-record reporting
+
+    func testLoadRecordsReportsUndecodableFiles() throws {
+        let store = KeyStore(root: root)
+        _ = try store.generateSigningKey(
+            policy: KeyPolicy(presence: .none, graceSeconds: 0),
+            label: "ok", creationTime: 1_700_000_000, forceSoftware: true)
+        // Drop a corrupt JSON file into the keys dir.
+        let bad = root.appendingPathComponent("keys/deadbeef.json")
+        try Data("{ not valid json".utf8).write(to: bad)
+
+        let (records, errors) = try store.loadRecords()
+        XCTAssertEqual(records.count, 1, "the good record still loads")
+        XCTAssertEqual(errors.count, 1, "the corrupt file is reported, not silently dropped")
+        XCTAssertTrue(errors[0].contains("deadbeef.json"), errors[0])
+    }
+
     func testSigningBackendFromSoftwareRecordSigns() throws {
         let store = KeyStore(root: root)
         let record = try store.generateSigningKey(

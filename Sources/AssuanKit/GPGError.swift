@@ -30,6 +30,8 @@ public enum GPGError: UInt32 {
     case noSeckey = 17
     /// GPG_ERR_INV_VALUE = 55
     case invValue = 55
+    /// GPG_ERR_NO_AGENT = 77 — no backend gpg-agent is reachable.
+    case noAgent = 77
     /// GPG_ERR_NOT_IMPLEMENTED = 69
     case notImplemented = 69
     /// GPG_ERR_INV_SEXP = 83

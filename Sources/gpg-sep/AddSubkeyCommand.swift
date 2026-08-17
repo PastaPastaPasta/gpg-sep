@@ -83,7 +83,8 @@ enum AddSubkeyCommand {
         if role == .signing {
             let auth = AuthSession(defaultGraceSeconds: policy.graceSeconds)
             let subSigner = try context.store.signingBackend(
-                keygripHex: subkeyRecord.keygripHex, context: auth.context(graceSeconds: policy.graceSeconds))
+                keygripHex: subkeyRecord.keygripHex,
+                context: auth.context(forKeygrip: subkeyRecord.keygripHex, graceSeconds: policy.graceSeconds))
             let backSig = PGPSignatureBuilder(type: .primaryKeyBinding)
             backSig.addHashed(.signatureCreationTime(creation))
             backSig.addHashed(.issuerFingerprint(subkey.fingerprint))

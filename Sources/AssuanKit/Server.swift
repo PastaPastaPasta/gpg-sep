@@ -120,7 +120,16 @@ public final class AssuanServer {
     public func run() throws {
         try client.write(.ok("\(greeting), process \(getpid())"))
         while true {
-            guard let raw = try client.readRawLine() else { return } // clean EOF
+            let raw: [UInt8]?
+            do {
+                raw = try client.readRawLine()
+            } catch let e as AssuanIOError where e.recoverable {
+                // An overlength but fully-consumed line: the stream is resynced,
+                // so answer ERR and keep serving instead of dropping the client.
+                try io.sendError(.assIncompleteLine, text: "line too long")
+                continue
+            }
+            guard let raw else { return } // clean EOF
             let line: AssuanLine
             do {
                 line = try AssuanLine.parseCommand(raw)
@@ -163,10 +172,17 @@ public final class AssuanServer {
             return
         case .forward:
             guard let backend else {
-                try io.sendError(.notImplemented, text: "no backend to forward to")
+                try io.sendError(.noAgent, text: "no backend gpg-agent to forward to")
                 return
             }
-            try relay(commandLine: raw, to: backend)
+            do {
+                try relay(commandLine: raw, to: backend)
+            } catch let e as AssuanIOError {
+                // The backend died mid-relay. Emit a clean ERR to terminate this
+                // command rather than letting a bare EOF desync the client. The
+                // client connection stays open so enclave keygrips keep working.
+                try? io.sendError(.noAgent, text: "backend relay failed: \(e.message)")
+            }
         }
     }
 

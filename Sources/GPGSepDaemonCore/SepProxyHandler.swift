@@ -15,7 +15,14 @@ import SEPKit
 public final class SepProxyHandler: AssuanCommandHandler {
     private let keyStore: KeyStore
     private let authSession: AuthSession
-    private let backend: AssuanClient
+    /// The backend gpg-agent connection, or `nil` when the backend is
+    /// unreachable. Enclave keygrips are still served in that state; only
+    /// *forwarded* commands fail with a clean `ERR`. Set to `nil` ("poisoned")
+    /// if one of our own `transact`s desyncs the shared connection.
+    private var backend: AssuanClient?
+
+    /// PID of the connecting client, used to attribute a Touch ID prompt.
+    private let peerProcessID: pid_t?
 
     /// Uppercase-hex keygrip currently selected, iff it is a store key. `nil`
     /// means the last selection (if any) routed to the backend.
@@ -23,11 +30,20 @@ public final class SepProxyHandler: AssuanCommandHandler {
     private var storedDigest: Data?
     private var storedHash: PGPHashAlgorithm?
 
-    /// Cache of store keygrips (uppercase), refreshed lazily.
-    public init(keyStore: KeyStore, authSession: AuthSession, backend: AssuanClient) {
+    /// The most recent `SETKEYDESC`, percent-plus-decoded. Carried into the Touch
+    /// ID prompt so the user sees what they are actually authorizing.
+    var keyDescription: String?
+
+    /// The `localizedReason` applied to the context for the most recent enclave
+    /// operation. Exposed for tests to assert consent integrity (H3).
+    private(set) var lastLocalizedReason: String?
+
+    public init(keyStore: KeyStore, authSession: AuthSession, backend: AssuanClient?,
+                peerProcessID: pid_t? = nil) {
         self.keyStore = keyStore
         self.authSession = authSession
         self.backend = backend
+        self.peerProcessID = peerProcessID
     }
 
     public func handle(verb: String, rest: String, io: AssuanServerIO) throws -> AssuanDisposition {
@@ -36,11 +52,43 @@ public final class SepProxyHandler: AssuanCommandHandler {
             selectedLocalGrip = nil
             storedDigest = nil
             storedHash = nil
+            keyDescription = nil
+            // Answer locally when decoupled so a dead backend can't break the
+            // preamble of an otherwise pure-enclave signing session (C1).
+            if backend == nil { try io.sendOK(); return .handled }
+            return .forward
+        case "OPTION", "NOP":
+            // Housekeeping verbs gpg issues before signing. When there is no
+            // backend to forward them to, ack locally rather than failing — the
+            // options are advisory and enclave signing needs no pinentry.
+            if backend == nil { try io.sendOK(); return .handled }
+            return .forward
+        case "GETINFO":
+            // gpg aborts the whole session if `GETINFO version` fails, so when the
+            // backend is gone we must still answer it (a conservative version that
+            // satisfies gpg's minimum) instead of erroring out the enclave path.
+            if backend == nil { return try handleGetInfoOffline(rest, io: io) }
+            return .forward
+        case "KILLAGENT":
+            // Do NOT forward: killing the backend out from under the proxy is
+            // what wedges the whole stack (`gpgconf --kill gpg-agent`). Ack
+            // locally so the proxy — and thus enclave signing — stays alive; the
+            // backend is (re)started on demand by the serve path. To fully
+            // restart everything, restart the gpg-sep-agent service.
+            try io.sendOK()
+            return .handled
+        case "RELOADAGENT":
+            // Safe to forward (it only reloads backend config). With no backend
+            // reachable there is nothing to reload, so ack locally.
+            if backend == nil { try io.sendOK(); return .handled }
             return .forward
         case "SIGKEY", "SETKEY":
             return try handleSelectKey(rest, io: io)
         case "SETKEYDESC":
-            // In local mode there is no backend pinentry to describe; ack it.
+            // Remember the description so the enclave prompt can quote it, then
+            // still forward when a backend key is (or may be) the target so its
+            // pinentry keeps describing the operation too.
+            keyDescription = AssuanEscaping.percentPlusDecodeToString(rest)
             if selectedLocalGrip != nil { try io.sendOK(); return .handled }
             return .forward
         case "SETHASH":
@@ -65,8 +113,12 @@ public final class SepProxyHandler: AssuanCommandHandler {
     // MARK: - Key selection
 
     private func handleSelectKey(_ rest: String, io: AssuanServerIO) throws -> AssuanDisposition {
-        // SIGKEY/SETKEY take a single keygrip, possibly preceded by options.
-        guard let grip = rest.split(separator: " ").last.map({ String($0).uppercased() }) else {
+        // SIGKEY/SETKEY take a single keygrip, possibly preceded by options. A
+        // value that is not a 40-hex keygrip is never one of ours (and must never
+        // reach the store's path logic); forward it to the backend unchanged.
+        guard let raw = rest.split(separator: " ").last.map(String.init),
+              let grip = KeyStore.normalizedKeygrip(raw) else {
+            selectedLocalGrip = nil
             return .forward
         }
         if try storeRecord(grip) != nil {
@@ -137,9 +189,12 @@ public final class SepProxyHandler: AssuanCommandHandler {
             return .handled
         }
         let record = try requireRecord(grip)
-        let context = authSession.context(graceSeconds: record.policy.graceSeconds)
-        let signer = try keyStore.signingBackend(keygripHex: grip, context: context)
-        let (r, s) = try signer.sign(digest: digest, hash: hash)
+        let (r, s): (Data, Data) = try authSession.withKeySerialized(grip) {
+            let context = authSession.context(forKeygrip: grip, graceSeconds: record.policy.graceSeconds)
+            context.localizedReason = applyLocalizedReason(for: record, action: "sign")
+            let signer = try keyStore.signingBackend(keygripHex: grip, context: context)
+            return try signer.sign(digest: digest, hash: hash)
+        }
         let sigVal = SExpression.ecdsaSigVal(r: r, s: s)
         try io.sendData(sigVal.serialize())
         try io.sendOK()
@@ -155,9 +210,12 @@ public final class SepProxyHandler: AssuanCommandHandler {
         try io.sendStatus(keyword: "INQUIRE_MAXLEN", args: "4096")
         let raw = try io.sendInquire(keyword: "CIPHERTEXT")
         let ciphertext = try RFC6637.parseCiphertext(raw)
-        let context = authSession.context(graceSeconds: record.policy.graceSeconds)
-        let agreement = try keyStore.agreementBackend(keygripHex: grip, context: context)
-        let blob = try RFC6637.recoverSessionKeyBlob(ciphertext: ciphertext, agreement: agreement)
+        let blob: Data = try authSession.withKeySerialized(grip) {
+            let context = authSession.context(forKeygrip: grip, graceSeconds: record.policy.graceSeconds)
+            context.localizedReason = applyLocalizedReason(for: record, action: "decrypt")
+            let agreement = try keyStore.agreementBackend(keygripHex: grip, context: context)
+            return try RFC6637.recoverSessionKeyBlob(ciphertext: ciphertext, agreement: agreement)
+        }
         let value = SExpression.list([.atom("value"), .atom(blob)])
         try io.sendData(value.serialize())
         try io.sendOK()
@@ -169,15 +227,21 @@ public final class SepProxyHandler: AssuanCommandHandler {
     private func handleHaveKey(_ rest: String, io: AssuanServerIO) throws -> AssuanDisposition {
         let trimmed = rest.trimmingCharacters(in: .whitespaces)
         if trimmed.hasPrefix("--list") {
-            let result = try backend.transact("HAVEKEY \(trimmed)")
-            var combined = result.data
+            var combined = Data()
             var seen = Set<Data>()
-            var i = combined.startIndex
-            while i + 20 <= combined.endIndex {
-                seen.insert(combined.subdata(in: i..<(i + 20)))
-                i += 20
+            if backend != nil, let result = transactOrPoison("HAVEKEY \(trimmed)") {
+                combined = result.data
+                var i = combined.startIndex
+                while i + 20 <= combined.endIndex {
+                    seen.insert(combined.subdata(in: i..<(i + 20)))
+                    i += 20
+                }
             }
+            // Honor the client's requested bound: never return more grips than
+            // `--list=N` asked for (N counts backend + store grips together).
+            let limit = Self.listLimit(trimmed)
             for record in try keyStore.allRecords() {
+                if let limit, combined.count / 20 >= limit { break }
                 guard let grip = Data(hexString: record.keygripHex), grip.count == 20 else { continue }
                 if seen.insert(grip).inserted { combined.append(grip) }
             }
@@ -194,7 +258,10 @@ public final class SepProxyHandler: AssuanCommandHandler {
             try io.sendOK()
             return .handled
         }
-        let result = try backend.transact("HAVEKEY \(remainder.joined(separator: " "))")
+        guard backend != nil, let result = transactOrPoison("HAVEKEY \(remainder.joined(separator: " "))") else {
+            try io.sendError(.noAgent, text: "no backend gpg-agent for non-enclave keygrips")
+            return .handled
+        }
         if let error = result.error {
             try io.sendError(error)
         } else {
@@ -203,14 +270,36 @@ public final class SepProxyHandler: AssuanCommandHandler {
         return .handled
     }
 
+    /// Answer `GETINFO` locally while decoupled from the backend, so gpg's
+    /// pre-signing handshake does not abort on a dead backend. Only `version`
+    /// needs a concrete reply (gpg treats its failure as fatal); other queries
+    /// are advisory and can be acked with no data.
+    private func handleGetInfoOffline(_ rest: String, io: AssuanServerIO) throws -> AssuanDisposition {
+        if rest.trimmingCharacters(in: .whitespaces) == "version" {
+            // A conservative floor that clears gpg's minimum-agent-version check.
+            try io.sendData(Data("2.4.0".utf8))
+        }
+        try io.sendOK()
+        return .handled
+    }
+
+    /// Parse the `N` from a `--list=N` argument, if present and positive.
+    static func listLimit(_ arg: String) -> Int? {
+        guard let token = arg.split(separator: " ").first(where: { $0.hasPrefix("--list") }),
+              let eq = token.firstIndex(of: "="),
+              let n = Int(token[token.index(after: eq)...]), n > 0 else { return nil }
+        return n
+    }
+
     // MARK: - KEYINFO
 
     private func handleKeyInfo(_ rest: String, io: AssuanServerIO) throws -> AssuanDisposition {
         let trimmed = rest.trimmingCharacters(in: .whitespaces)
         if trimmed.hasPrefix("--list") {
-            let result = try backend.transact("KEYINFO \(trimmed)")
-            for status in result.statuses {
-                try io.sendStatus(keyword: status.keyword, args: status.args)
+            if backend != nil, let result = transactOrPoison("KEYINFO \(trimmed)") {
+                for status in result.statuses {
+                    try io.sendStatus(keyword: status.keyword, args: status.args)
+                }
             }
             for record in try keyStore.allRecords() {
                 try io.sendStatus(keyword: "KEYINFO", args: keyInfoLine(grip: record.keygripHex.uppercased()))
@@ -218,7 +307,8 @@ public final class SepProxyHandler: AssuanCommandHandler {
             try io.sendOK()
             return .handled
         }
-        guard let grip = trimmed.split(separator: " ").last.map({ String($0).uppercased() }) else {
+        guard let raw = trimmed.split(separator: " ").last.map(String.init),
+              let grip = KeyStore.normalizedKeygrip(raw) else {
             return .forward
         }
         if try storeRecord(grip) != nil {
@@ -229,17 +319,23 @@ public final class SepProxyHandler: AssuanCommandHandler {
         return .forward
     }
 
-    /// KEYINFO status arguments matching what gpg-agent 2.5.20 emits for an
-    /// available on-disk key: `<grip> D - - - C - - -` (type D = on disk,
-    /// protection C = clear). Verified against the live agent.
+    /// KEYINFO status arguments for a store key: `<grip> D - - - P - - -`.
+    ///
+    /// Type `D` (on disk) matches how gpg selects the key and routes its PKSIGN to
+    /// us. Protection `P` (protected) is the honest value — an enclave key demands
+    /// Touch ID / presence and is never clear on disk. Verified against live
+    /// gpg-agent 2.5.20, which emits exactly `D - - - P - - -` for a
+    /// passphrase-protected on-disk key and `... C ...` only for an *unprotected*
+    /// one; reporting `C` would misrepresent the key as unprotected.
     private func keyInfoLine(grip: String) -> String {
-        "\(grip) D - - - C - - -"
+        "\(grip) D - - - P - - -"
     }
 
     // MARK: - READKEY
 
     private func handleReadKey(_ rest: String, io: AssuanServerIO) throws -> AssuanDisposition {
-        guard let grip = rest.split(separator: " ").last.map({ String($0).uppercased() }) else {
+        guard let raw = rest.split(separator: " ").last.map(String.init),
+              let grip = KeyStore.normalizedKeygrip(raw) else {
             return .forward
         }
         guard let record = try storeRecord(grip) else { return .forward }
@@ -252,7 +348,8 @@ public final class SepProxyHandler: AssuanCommandHandler {
     // MARK: - EXPORT_KEY
 
     private func handleExportKey(_ rest: String, io: AssuanServerIO) throws -> AssuanDisposition {
-        guard let grip = rest.split(separator: " ").last.map({ String($0).uppercased() }) else {
+        guard let raw = rest.split(separator: " ").last.map(String.init),
+              let grip = KeyStore.normalizedKeygrip(raw) else {
             return .forward
         }
         if try storeRecord(grip) != nil {
@@ -274,6 +371,40 @@ public final class SepProxyHandler: AssuanCommandHandler {
             throw AssuanError(code: .noSeckey, text: "no store key for keygrip \(grip)")
         }
         return record
+    }
+
+    /// Run a `transact` on the shared backend connection. If it throws, the
+    /// connection is desynced (a `D`/`S`/`OK`/`ERR` may be left unread), so we
+    /// poison it — close and forget it — rather than reuse a corrupt stream for
+    /// later forwards. Returns nil when there is no usable backend.
+    private func transactOrPoison(_ command: String) -> AssuanResult? {
+        guard let backend else { return nil }
+        do {
+            return try backend.transact(command)
+        } catch {
+            backend.connection.close()
+            self.backend = nil
+            return nil
+        }
+    }
+
+    /// Build the Touch ID prompt text (H3) and record it for tests. Prefers the
+    /// client-supplied `SETKEYDESC`; otherwise synthesizes an attributable reason
+    /// so the user can tell their own operation from an attacker's.
+    private func applyLocalizedReason(for record: EnclaveKeyRecord, action: String) -> String {
+        let reason: String
+        if let desc = keyDescription, !desc.isEmpty {
+            reason = desc
+        } else {
+            let shortID = record.fingerprintHex.isEmpty
+                ? String(record.keygripHex.uppercased().prefix(16))
+                : String(record.fingerprintHex.uppercased().suffix(16))
+            let label = record.label.isEmpty ? "enclave key" : record.label
+            let pid = peerProcessID.map(String.init) ?? "?"
+            reason = "gpg-sep: \(action) with \(label) (\(shortID)) requested by pid \(pid)"
+        }
+        lastLocalizedReason = reason
+        return reason
     }
 }
 

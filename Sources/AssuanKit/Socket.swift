@@ -6,9 +6,14 @@ import Darwin
 public struct AssuanIOError: Error, Equatable {
     public let message: String
     public let errnoValue: Int32
-    public init(_ message: String, errno: Int32 = 0) {
+    /// True when the stream is still in sync after this error, so the caller can
+    /// report an `ERR` and keep serving instead of dropping the connection. Set
+    /// for an overlength line that was fully consumed (terminator seen).
+    public let recoverable: Bool
+    public init(_ message: String, errno: Int32 = 0, recoverable: Bool = false) {
         self.message = message
         self.errnoValue = errno
+        self.recoverable = recoverable
     }
 }
 
@@ -102,7 +107,11 @@ public final class AssuanConnection {
                 inbuf.removeSubrange(0...nl) // drop line + '\n'
                 scanned = 0
                 guard line.count <= maxLineLength else {
-                    throw AssuanIOError("line of \(line.count) bytes exceeds \(maxLineLength)")
+                    // The whole line (and its terminator) has been consumed, so
+                    // the stream is back in sync: the caller can emit an ERR and
+                    // keep serving rather than closing the connection.
+                    throw AssuanIOError(
+                        "line of \(line.count) bytes exceeds \(maxLineLength)", recoverable: true)
                 }
                 return stripCR(line)
             }

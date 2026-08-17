@@ -51,13 +51,17 @@ Intercepted for enclave keygrips:
 
 | Command | Handling |
 |---|---|
-| `SIGKEY`/`SETKEY <grip>` | Record the selected keygrip for the next operation. |
+| `SIGKEY`/`SETKEY <grip>` | Record the selected keygrip for the next operation. A value that is not a 40-hex keygrip is never ours: it is forwarded, never used for a store lookup (defends against path-traversal grips like `../../evil`). |
 | `SETHASH --hash=<name>\|<n> <hex>` | Store the precomputed digest and its hash algorithm. `--inquire` (deferred hashing) is not supported in v1. |
 | `PKSIGN [...]` | Sign the stored digest in the enclave; reply `D (7:sig-val(5:ecdsa(1:r32:…)(1:s32:…)))` then `OK`. |
 | `PKDECRYPT` | ECDH: enclave yields the shared X; RFC 6637 KDF + AES key-unwrap performed in-process; reply the session key S-expression. |
 | `HAVEKEY <grips>` | `OK` iff all listed grips are held (enclave grips answered locally, others delegated). |
 | `HAVEKEY --list` | Union of backend grips and enclave grips (20-byte binary blobs over `D`). |
-| `KEYINFO [--list] <grip>` | Report enclave grips as available; type/protection fields chosen to match how gpg expects an available secret key. |
+| `KEYINFO [--list] <grip>` | Report enclave grips as available, with fields `<grip> D - - - P - - -`: type `D` (on disk) so gpg selects the key and routes its `PKSIGN` to us, protection `P` (protected) because an enclave key demands Touch ID / presence and is never clear on disk. Reporting `C` (clear) would misrepresent it as unprotected; verified against gpg-agent 2.5.20, which emits `... P ...` for a passphrase-protected on-disk key and `... C ...` only for an unprotected one. |
+| `SETKEYDESC <text>` | Percent-plus-decoded and carried into the enclave Touch ID prompt (`LAContext.localizedReason`) so the user sees what they are authorizing. Also forwarded when a backend key may be the target so its pinentry still describes the operation. |
+| `HAVEKEY --list[=N]` | Union of backend and enclave grips, but never more than the client's requested `N`. |
+| `KILLAGENT` | **Not forwarded.** Acked locally so `gpgconf --kill gpg-agent` cannot wedge the stack by killing the backend out from under the proxy; the proxy (and thus enclave signing) stays up and the backend is restarted on demand. Restart the `gpg-sep-agent` service to fully restart everything. |
+| `RELOADAGENT` | Forwarded (it only reloads backend config); acked locally when no backend is reachable. |
 | `READKEY <grip>` | Return the public key S-expression `(public-key(ecc(curve nistp256)(q <point>)))`. |
 | `EXPORT_KEY <grip>` | Refused with an error — enclave keys are non-exportable by design. |
 
@@ -65,6 +69,15 @@ Everything else (`GENKEY` for non-enclave keys, `PKDECRYPT` for on-disk keys,
 scdaemon-backed smartcard operations, `GETINFO`, `OPTION`, `RESET`, pinentry
 `INQUIRE` round-trips, …) is relayed to the backend unchanged, including
 bidirectional `INQUIRE` streaming with escaping preserved.
+
+**Backend unreachable (decoupled mode).** If the backend gpg-agent cannot be
+started or connected, the proxy still serves enclave keygrips: `SIGKEY`/`SETHASH`/
+`PKSIGN`/`PKDECRYPT`/`HAVEKEY`/`KEYINFO`/`READKEY` for store keys keep working, and
+the pre-signing housekeeping verbs gpg relies on (`RESET`, `OPTION`, `NOP`, and
+`GETINFO version`) are answered locally so a dead backend cannot abort an enclave
+signature. Genuinely backend-only commands (an on-disk key op, membership of a
+non-store keygrip, other `GETINFO` queries) return a clean `ERR` (`GPG_ERR_NO_AGENT`)
+rather than hanging or dropping the connection.
 
 ## Canonical S-expressions
 

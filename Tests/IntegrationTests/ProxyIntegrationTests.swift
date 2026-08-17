@@ -72,6 +72,7 @@ final class ProxyIntegrationTests: XCTestCase {
 
         let backendSocket: String
         let server: SepAgentServer
+        var backendAgent: BackendAgent!
         let userSocket: String
 
         /// A passphrase-protected on-disk key living in the backend agent, to
@@ -171,16 +172,25 @@ final class ProxyIntegrationTests: XCTestCase {
             guard !userSocket.isEmpty else { throw Failure("no user agent socket path") }
 
             let auth = AuthSession(defaultGraceSeconds: 0)
-            let backend = BackendAgent(existingSocketPath: backendSocket)
-            try backend.start()
+            self.backendAgent = BackendAgent(existingSocketPath: backendSocket)
+            try backendAgent.start()
             server = try SepAgentServer(
                 standardSocketPath: userSocket, keyStore: store,
-                authSession: auth, backendSocketPath: backendSocket)
+                authSession: auth, backend: backendAgent)
             server.startInBackground()
         }
 
         func gpgUser(_ args: [String], input: String? = nil) -> (out: String, status: Int32) {
             ProxyIntegrationTests.run(gpg, ["--homedir", userHome] + args, input: input)
+        }
+
+        /// Kill the backend gpg-agent out from under the proxy, simulating a
+        /// crash or a `gpgconf --kill`. The proxy must not die with it.
+        func killBackend() {
+            _ = ProxyIntegrationTests.run(gpgconf, ["--homedir", backendHome, "--kill", "gpg-agent"])
+            if FileManager.default.isExecutableFile(atPath: "/usr/bin/pkill") {
+                _ = ProxyIntegrationTests.run("/usr/bin/pkill", ["-f", "gpg-agent --homedir \(backendHome)"])
+            }
         }
 
         func tearDown() {
@@ -355,6 +365,78 @@ final class ProxyIntegrationTests: XCTestCase {
 
             let verify = fx.gpgUser(["--verify", doc + ".sig", doc])
             XCTAssertEqual(verify.status, 0, "verify failed: \(verify.out)")
+            XCTAssertTrue(verify.out.contains("Good signature"), verify.out)
+        }
+    }
+
+    // MARK: 1b. Enclave signing under forced SHA-384 / SHA-512 (gpg-verified)
+
+    /// Guards against a future digest-truncation regression in the software /
+    /// enclave backends: gpg is forced to sign with SHA-384 and SHA-512 and must
+    /// still produce signatures gpg itself verifies as good. This is the
+    /// non-circular interop check the pure-CryptoKit unit tests cannot give.
+    func testEnclaveSigningWithForcedSHA384AndSHA512() throws {
+        try withFixture { fx in
+            for algo in ["SHA384", "SHA512"] {
+                let doc = fx.userHome + "/doc-\(algo).txt"
+                try "hash both ways\n".write(toFile: doc, atomically: true, encoding: .utf8)
+                let sign = fx.gpgUser([
+                    "--batch", "--yes", "--digest-algo", algo, "-u", fx.primaryFingerprint,
+                    "--detach-sign", "-o", doc + ".sig", doc])
+                XCTAssertEqual(sign.status, 0, "\(algo) enclave detach-sign failed: \(sign.out)")
+                let verify = fx.gpgUser(["--verify", doc + ".sig", doc])
+                XCTAssertEqual(verify.status, 0, "\(algo) verify failed: \(verify.out)")
+                XCTAssertTrue(verify.out.contains("Good signature"), verify.out)
+            }
+        }
+    }
+
+    // MARK: 6. Backend death does not brick enclave signing (C1)
+
+    func testBackendDeathStillAllowsEnclaveSigningAndForwardsReturnCleanERR() throws {
+        try withFixture { fx in
+            // Kill the backend agent while the proxy keeps running.
+            fx.killBackend()
+
+            // (a)+(c) A SEP-key detach-sign STILL succeeds and verifies.
+            let doc = fx.userHome + "/afterkill.txt"
+            try "sign me after backend death\n".write(toFile: doc, atomically: true, encoding: .utf8)
+            let sign = fx.gpgUser([
+                "--batch", "--yes", "-u", fx.primaryFingerprint,
+                "--detach-sign", "-o", doc + ".sig", doc])
+            XCTAssertEqual(sign.status, 0, "SEP signing must survive backend death: \(sign.out)")
+            let verify = fx.gpgUser(["--verify", doc + ".sig", doc])
+            XCTAssertEqual(verify.status, 0, "verify after backend death failed: \(verify.out)")
+            XCTAssertTrue(verify.out.contains("Good signature"), verify.out)
+
+            // (d) A genuinely backend-only op (membership of a non-store keygrip)
+            // returns a clean terminal ERR — never a hang or a bare EOF.
+            let client = try AssuanClient.connect(toSocket: fx.userSocket)
+            defer { client.connection.close() }
+            let forwarded = try client.transact(
+                "HAVEKEY " + String(repeating: "0", count: 40))
+            XCTAssertNotNil(forwarded.error,
+                            "a forwarded op with a dead backend must return a clean ERR, not hang")
+        }
+    }
+
+    // MARK: 7. KILLAGENT does not wedge the running stack (C1)
+
+    func testKillAgentThroughProxyDoesNotWedgeSigning() throws {
+        try withFixture { fx in
+            let client = try AssuanClient.connect(toSocket: fx.userSocket)
+            let kill = try client.transact("KILLAGENT")
+            client.connection.close()
+            XCTAssertTrue(kill.isOK, "KILLAGENT must be acked, not forwarded into a wedge")
+
+            // Signing with the SEP key still works right after.
+            let doc = fx.userHome + "/afterkillagent.txt"
+            try "still signing\n".write(toFile: doc, atomically: true, encoding: .utf8)
+            let sign = fx.gpgUser([
+                "--batch", "--yes", "-u", fx.primaryFingerprint,
+                "--detach-sign", "-o", doc + ".sig", doc])
+            XCTAssertEqual(sign.status, 0, "SEP signing must work after KILLAGENT: \(sign.out)")
+            let verify = fx.gpgUser(["--verify", doc + ".sig", doc])
             XCTAssertTrue(verify.out.contains("Good signature"), verify.out)
         }
     }

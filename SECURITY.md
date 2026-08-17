@@ -60,6 +60,16 @@ the real gpg-agent. Consequences:
   the stock gpg-agent and you are back to your exact pre-install setup. Enclave
   keys become temporarily inert; nothing else breaks. `gpg-sep uninstall`
   restores the stock agent permanently.
+- **Backend death does not brick signing.** The proxy is decoupled from the
+  backend gpg-agent it forwards to: if that backend dies (including via
+  `gpgconf --kill gpg-agent`, which the proxy intercepts rather than forwarding),
+  enclave keygrips keep signing, and the proxy restarts the backend on demand for
+  forwarded traffic. A forwarded operation against a still-dead backend returns a
+  clean error, never a hang. The remaining single point of failure is the proxy
+  process itself, which launchd (`KeepAlive`) relaunches; a relaunched proxy binds
+  a clean socket and rebuilds the backend.
+- **Single instance.** The daemon takes an exclusive lockfile before it touches
+  the socket, so two instances cannot race and clobber each other's socket.
 - `EXPORT_KEY` for an enclave keygrip is refused by design.
 
 ## Operational guidance

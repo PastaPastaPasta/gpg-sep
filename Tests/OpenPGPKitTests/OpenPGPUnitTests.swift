@@ -81,6 +81,19 @@ final class OpenPGPUnitTests: XCTestCase {
         XCTAssertThrowsError(try ecdsaDERToRawRS(Data([0x31, 0x00])))
     }
 
+    /// A P-256 (r, s) INTEGER is always short-form; a long-form length byte
+    /// (high bit set) must be rejected rather than misread as a tiny length,
+    /// which would desync the parse. `0x30 06 02 81 01 41 02 01 05`:
+    /// SEQUENCE(len 6){ INTEGER len=0x81(long-form) … }.
+    func testDERToRawRSRejectsLongFormIntegerLength() {
+        let der = Data([0x30, 0x06, 0x02, 0x81, 0x01, 0x41, 0x02, 0x01, 0x05])
+        XCTAssertThrowsError(try ecdsaDERToRawRS(der)) { error in
+            guard case OpenPGPError.invalidDER = error else {
+                return XCTFail("expected invalidDER for long-form INTEGER length, got \(error)")
+            }
+        }
+    }
+
     func testArmorRoundTripAndCRC() throws {
         let payload = Data((0..<200).map { UInt8($0 & 0xFF) })
         let armored = Armor.armor(payload, type: .publicKey)

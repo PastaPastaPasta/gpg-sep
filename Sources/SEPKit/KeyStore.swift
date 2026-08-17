@@ -100,28 +100,58 @@ public final class KeyStore {
 
     // MARK: Reading
 
-    /// All stored records (unordered; unreadable/foreign JSON files are skipped).
-    public func allRecords() throws -> [EnclaveKeyRecord] {
-        guard FileManager.default.fileExists(atPath: keysDir.path) else { return [] }
+    /// A keygrip is a 40-character hex string. Anything else is not one of our
+    /// keys — and, critically, must never reach ``recordURL(keygripHex:)`` where a
+    /// crafted value like `../../evil` would escape the keys directory. Returns
+    /// the normalized (uppercase) grip, or nil if malformed.
+    public static func normalizedKeygrip(_ raw: String) -> String? {
+        guard raw.count == 40, raw.allSatisfy(\.isHexDigit) else { return nil }
+        return raw.uppercased()
+    }
+
+    /// All stored records plus a human-readable message for each JSON file that
+    /// could not be read or decoded, so callers (e.g. `doctor`) can surface
+    /// corruption instead of silently ignoring it.
+    public func loadRecords() throws -> (records: [EnclaveKeyRecord], errors: [String]) {
+        guard FileManager.default.fileExists(atPath: keysDir.path) else { return ([], []) }
         let urls = try FileManager.default.contentsOfDirectory(
             at: keysDir, includingPropertiesForKeys: nil
         ).filter { $0.pathExtension == "json" }
         let decoder = JSONDecoder()
         var records: [EnclaveKeyRecord] = []
+        var errors: [String] = []
         for url in urls {
-            guard let data = try? Data(contentsOf: url),
-                  let record = try? decoder.decode(EnclaveKeyRecord.self, from: data) else {
+            guard let data = try? Data(contentsOf: url) else {
+                errors.append("\(url.lastPathComponent): unreadable")
                 continue
             }
-            records.append(record)
+            do {
+                records.append(try decoder.decode(EnclaveKeyRecord.self, from: data))
+            } catch {
+                errors.append("\(url.lastPathComponent): undecodable (\(error))")
+            }
+        }
+        return (records, errors)
+    }
+
+    /// All stored records (unordered). Files that fail to read/decode are skipped
+    /// but logged to stderr so the corruption is at least visible in the daemon
+    /// log; use ``loadRecords()`` to inspect the errors programmatically.
+    public func allRecords() throws -> [EnclaveKeyRecord] {
+        let (records, errors) = try loadRecords()
+        if !errors.isEmpty {
+            FileHandle.standardError.write(Data(
+                ("gpg-sep: skipped \(errors.count) unreadable key record(s): "
+                 + errors.joined(separator: "; ") + "\n").utf8))
         }
         return records
     }
 
-    /// The record for `keygripHex`, or nil if absent. The lookup is
-    /// case-insensitive on the hex.
+    /// The record for `keygripHex`, or nil if absent or if `keygripHex` is not a
+    /// valid 40-hex keygrip. The lookup is case-insensitive on the hex.
     public func record(keygripHex: String) throws -> EnclaveKeyRecord? {
-        let url = recordURL(keygripHex: keygripHex)
+        guard let grip = Self.normalizedKeygrip(keygripHex) else { return nil }
+        let url = recordURL(keygripHex: grip)
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try JSONDecoder().decode(EnclaveKeyRecord.self, from: data)
     }
@@ -234,7 +264,8 @@ public final class KeyStore {
     /// ability to reference it, which for a non-exportable SEP key is equivalent
     /// to loss.
     public func delete(keygripHex: String) throws {
-        let url = recordURL(keygripHex: keygripHex)
+        guard let grip = Self.normalizedKeygrip(keygripHex) else { return }
+        let url = recordURL(keygripHex: grip)
         if FileManager.default.fileExists(atPath: url.path) {
             try FileManager.default.removeItem(at: url)
         }
@@ -250,7 +281,12 @@ public final class KeyStore {
     }
 
     private func recordURL(keygripHex: String) -> URL {
-        keysDir.appendingPathComponent("\(keygripHex.uppercased()).json", isDirectory: false)
+        // Defensive: use only the final path component so a crafted keygrip that
+        // somehow slipped validation (e.g. "../../evil") still cannot escape the
+        // keys directory. Valid 40-hex grips have no separators, so this is a
+        // no-op for them.
+        let safe = (keygripHex.uppercased() as NSString).lastPathComponent
+        return keysDir.appendingPathComponent("\(safe).json", isDirectory: false)
     }
 
     private func write(_ record: EnclaveKeyRecord) throws {

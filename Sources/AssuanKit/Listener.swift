@@ -34,10 +34,17 @@ public final class AssuanListener {
     ///     inode that really is a socket is removed, so a mistyped path can
     ///     never destroy a regular file.
     ///   - backlog: `listen(2)` backlog.
+    /// - Parameters:
+    ///   - refuseLiveSocket: when true, refuse to replace a socket that still has
+    ///     a *live* listener (a probe `connect()` succeeds), throwing instead of
+    ///     clobbering it. The daemon leaves this off: it deliberately takes over
+    ///     the stock gpg-agent's live socket, and single-instance exclusion is
+    ///     enforced up front by ``InstanceLock`` rather than by socket liveness.
     public init(
         path: String,
         permissions: mode_t = 0o600,
         replaceStale: Bool = true,
+        refuseLiveSocket: Bool = false,
         backlog: Int32 = 64
     ) throws {
         self.path = path
@@ -46,6 +53,13 @@ public final class AssuanListener {
         if replaceStale {
             var st = stat()
             if lstat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFSOCK {
+                // Never destroy a socket another live listener owns when the
+                // caller asked us not to; a mistaken path could otherwise steal a
+                // running agent's socket.
+                if refuseLiveSocket, Self.socketIsLive(path) {
+                    throw AssuanIOError(
+                        "socket \(path) is already served by a live listener", errno: EADDRINUSE)
+                }
                 unlink(path)
             }
         }
@@ -54,6 +68,12 @@ public final class AssuanListener {
         guard sock >= 0 else { throw AssuanIOError("socket() failed", errno: errno) }
         self.fd = sock
         AssuanListener.suppressSIGPIPE(sock)
+
+        // Create the socket inode private from the start: the mode is (0666 &
+        // ~umask), so a permissive process umask would briefly expose a
+        // world-accessible socket between bind() and chmod(). Force it closed.
+        let savedMask = umask(0o177)
+        defer { umask(savedMask) }
 
         let len = socklen_t(MemoryLayout<sockaddr_un>.size)
         let bound = withUnsafePointer(to: &addr) {
@@ -104,9 +124,20 @@ public final class AssuanListener {
     /// One thread per connection is what gpg-agent does, and it is what the
     /// proxy needs: a Secure Enclave signature can block for as long as the
     /// user takes to touch Touch ID, and that must not stall other clients.
+    /// Upper bound on concurrently-served connections. A hostile or buggy client
+    /// that opens connections in a tight loop would otherwise spawn unbounded
+    /// threads; the semaphore caps live handlers and applies natural backpressure
+    /// (new accepts wait for a slot). 128 is far above any real gpg workload.
+    public static let maxConcurrentConnections = 128
+
     public func serveForever(_ handler: @escaping (AssuanConnection) -> Void) throws {
+        let slots = DispatchSemaphore(value: Self.maxConcurrentConnections)
         while let conn = try accept() {
-            let thread = Thread { handler(conn) }
+            slots.wait()
+            let thread = Thread {
+                handler(conn)
+                slots.signal()
+            }
             thread.name = "assuan-connection"
             thread.stackSize = 512 * 1024
             thread.start()
@@ -129,6 +160,21 @@ public final class AssuanListener {
                 unlink(path)
             }
         }
+    }
+
+    /// Probe whether something is actively listening at `path`: a successful
+    /// `connect(2)` means a live peer, so the socket is not stale.
+    static func socketIsLive(_ path: String) -> Bool {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { _ = Darwin.close(fd) }
+        var addr: sockaddr_un
+        do { addr = try makeAddress(path: path) } catch { return false }
+        let len = socklen_t(MemoryLayout<sockaddr_un>.size)
+        let rc = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, len) }
+        }
+        return rc == 0
     }
 
     static func makeAddress(path: String) throws -> sockaddr_un {
@@ -182,10 +228,11 @@ extension AssuanConnection {
         return cred.cr_uid
     }
 
-    /// True when the peer runs as this process's user, or when the kernel will
-    /// not say (in which case the socket's mode is the only defence left).
+    /// True only when the peer is confirmed to run as this process's user. If the
+    /// kernel will not report the peer's UID we fail *closed* and refuse the
+    /// connection: an unverifiable peer must not be trusted on a signing socket.
     public var peerIsSameUser: Bool {
-        guard let uid = peerUserID else { return true }
+        guard let uid = peerUserID else { return false }
         return uid == getuid()
     }
 }

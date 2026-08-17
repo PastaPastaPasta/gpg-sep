@@ -180,8 +180,14 @@ enum DoctorCommand {
     /// have a keygrip that still matches its stored public point.
     static func storeCheck(store: KeyStore) -> [Check] {
         let records: [EnclaveKeyRecord]
-        do { records = try store.allRecords() } catch {
+        let loadErrors: [String]
+        do { (records, loadErrors) = try store.loadRecords() } catch {
             return [Check(name: "Key store", status: .fail, detail: "unreadable: \(error)")]
+        }
+        // Surface corrupt/undecodable JSON rather than silently ignoring it.
+        if !loadErrors.isEmpty {
+            return [Check(name: "Key store", status: .fail,
+                          detail: "unreadable key record(s):\n" + loadErrors.joined(separator: "\n"))]
         }
         if records.isEmpty {
             return [Check(name: "Key store", status: .skip,

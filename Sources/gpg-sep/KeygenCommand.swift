@@ -42,7 +42,8 @@ enum KeygenCommand {
         let primary = PGPPublicKeyPacket(creationTime: creation, algorithm: .ecdsa, point: primaryRecord.point)
         let uid = PGPUserIDPacket(uidString)
         let primarySigner = try store.signingBackend(
-            keygripHex: primaryRecord.keygripHex, context: auth.context(graceSeconds: policy.graceSeconds))
+            keygripHex: primaryRecord.keygripHex,
+            context: auth.context(forKeygrip: primaryRecord.keygripHex, graceSeconds: policy.graceSeconds))
         func signPrimary(_ digest: Data, _ hash: PGPHashAlgorithm) throws -> (r: Data, s: Data) {
             try primarySigner.sign(digest: digest, hash: hash)
         }

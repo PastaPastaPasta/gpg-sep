@@ -348,6 +348,74 @@ final class LoopbackTests: XCTestCase {
             "a regular file at the socket path must be left untouched")
     }
 
+    /// M1: with `refuseLiveSocket`, a socket that still has a live listener is
+    /// never clobbered; a stale inode (no listener) is still replaced.
+    func testRefuseLiveSocketProtectsALiveListenerButReplacesAStaleOne() throws {
+        let path = try TemporarySocketPath()
+        defer { path.cleanup() }
+
+        // Live listener: a second bind with refuseLiveSocket must be refused.
+        let live = try AssuanListener(path: path.socket)
+        XCTAssertThrowsError(try AssuanListener(path: path.socket, refuseLiveSocket: true),
+                             "a live socket must not be clobbered when refuseLiveSocket is set")
+        live.closeAndUnlink()
+
+        // Stale inode (bound, no listener): a probe connect() is refused, so it is
+        // treated as stale and replaced.
+        makeStaleSocket(at: path.socket)
+        let replacement = try AssuanListener(path: path.socket, refuseLiveSocket: true)
+        replacement.closeAndUnlink()
+    }
+
+    /// Create a stale AF_UNIX socket inode: bound so the file exists, but with no
+    /// listener, so a probe `connect()` is refused and the path counts as stale.
+    private func makeStaleSocket(at socketPath: String) {
+        let s = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard s >= 0 else { return }
+        var addr = try! AssuanListener.makeAddress(path: socketPath)
+        let len = socklen_t(MemoryLayout<sockaddr_un>.size)
+        _ = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(s, $0, len) }
+        }
+        _ = Darwin.close(s) // inode remains; nothing is listening
+    }
+
+    // MARK: - M2: errors surface as ERR, the connection is not dropped
+
+    func testOverlongCommandLineGetsERRAndConnectionStaysUsable() throws {
+        let client = try makeClient { _, _, io in try io.sendOK("still here"); return .handled }
+        defer { client.connection.close() }
+        // 2000 bytes, well over ASSUAN_LINELENGTH, sent raw to bypass the guard.
+        var raw = Array("NOP ".utf8)
+        raw += Array(repeating: UInt8(ascii: "x"), count: 2000)
+        raw.append(0x0A)
+        try client.connection.writeRawForTesting(raw)
+        guard let line = try client.connection.readResponseLine(), case .err = line else {
+            return XCTFail("an overlong line must produce an ERR, not a dropped connection")
+        }
+        XCTAssertEqual(try client.transact("NOP").okText, "still here",
+                       "the connection must resync and keep serving after the ERR")
+    }
+
+    func testBackendDeathMidRelayYieldsERRNotBareEOF() throws {
+        let (backendServerSide, backendClientSide) = try AssuanConnection.makePair()
+        let backendThread = Thread {
+            // Greet, read the one relayed command, then die without answering.
+            try? backendServerSide.write(.ok(AssuanLimits.defaultGreeting))
+            _ = try? backendServerSide.readRawLine()
+            backendServerSide.close()
+        }
+        backendThread.start()
+        // Consume the backend greeting, as the real proxy does on connect.
+        _ = try backendClientSide.readResponseLine()
+
+        let client = try makeClient(backend: backendClientSide) { _, _, _ in .forward }
+        defer { client.connection.close() }
+        let result = try client.transact("READKEY ABCD")
+        XCTAssertNotNil(result.error,
+                        "a backend that dies mid-relay must surface as ERR, not a hang or bare EOF")
+    }
+
     // MARK: Proxy relay
 
     func testForwardRelaysCommandsAndDataToABackend() throws {

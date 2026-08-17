@@ -55,6 +55,22 @@ guard !socketPath.isEmpty else {
     exit(1)
 }
 
+// Single-instance guard, taken BEFORE we kill the stock agent: two gpg-sep-agents
+// racing here would have the second kill the first's freshly-started backend and
+// clobber its socket. If another instance already holds the lock, bail out.
+let instanceLock: InstanceLock
+do {
+    guard let lock = try InstanceLock.tryAcquire(path: socketPath + ".gpg-sep.lock") else {
+        FileHandle.standardError.write(Data(
+            "gpg-sep-agent: another instance is already running; exiting\n".utf8))
+        exit(0)
+    }
+    instanceLock = lock
+} catch {
+    FileHandle.standardError.write(Data("gpg-sep-agent: \(error)\n".utf8))
+    exit(1)
+}
+
 // Free the standard socket so we can bind it; gpg's autostart will then find our
 // live socket and stay out of the way.
 killStandardAgent(gpgconf: gpgconf)
@@ -71,15 +87,14 @@ let backend = BackendAgent(
 )
 
 do {
-    try backend.start()
-    guard let backendSocket = backend.socketPath else {
-        throw BackendAgent.BackendError("backend agent produced no socket")
-    }
+    // Best-effort initial start; the serve path re-ensures the backend per
+    // connection, so a transient failure here no longer bricks enclave signing.
+    try? backend.start()
     let server = try SepAgentServer(
         standardSocketPath: socketPath,
         keyStore: keyStore,
         authSession: authSession,
-        backendSocketPath: backendSocket
+        backend: backend
     )
 
     // Clean shutdown on SIGTERM/SIGINT: drop the socket and stop the backend.
@@ -90,6 +105,7 @@ do {
     }
     SignalContext.server = server
     SignalContext.backend = backend
+    SignalContext.instanceLock = instanceLock // keep the lock held for our lifetime
     signal(SIGTERM, shutdown)
     signal(SIGINT, shutdown)
 
@@ -104,4 +120,5 @@ do {
 enum SignalContext {
     static var server: SepAgentServer?
     static var backend: BackendAgent?
+    static var instanceLock: InstanceLock?
 }

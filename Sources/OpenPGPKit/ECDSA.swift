@@ -33,7 +33,12 @@ public func ecdsaDERToRawRS(_ der: Data) throws -> (r: Data, s: Data) {
         guard bytes[i] == 0x02 else { throw OpenPGPError.invalidDER("expected INTEGER") }
         i += 1
         try need(1)
-        let len = Int(bytes[i]); i += 1
+        let lenByte = bytes[i]; i += 1
+        // A P-256 (r, s) INTEGER is at most 33 bytes, so its length is always DER
+        // short-form. Reject the long-form marker (high bit set) rather than
+        // misreading the length byte as a small value and desyncing the parse.
+        guard lenByte & 0x80 == 0 else { throw OpenPGPError.invalidDER("INTEGER length not short-form") }
+        let len = Int(lenByte)
         guard len > 0 else { throw OpenPGPError.invalidDER("empty INTEGER") }
         try need(len)
         var v = Array(bytes[i..<(i+len)])

@@ -12,7 +12,7 @@ public final class SepAgentServer {
     public let socketPath: String
     private let keyStore: KeyStore
     private let authSession: AuthSession
-    private let backendSocketPath: String
+    private let backend: BackendAgent
     private let listener: AssuanListener
     private var serveThread: Thread?
 
@@ -20,12 +20,12 @@ public final class SepAgentServer {
         standardSocketPath: String,
         keyStore: KeyStore,
         authSession: AuthSession,
-        backendSocketPath: String
+        backend: BackendAgent
     ) throws {
         self.socketPath = standardSocketPath
         self.keyStore = keyStore
         self.authSession = authSession
-        self.backendSocketPath = backendSocketPath
+        self.backend = backend
         self.listener = try AssuanListener(path: standardSocketPath)
     }
 
@@ -58,17 +58,34 @@ public final class SepAgentServer {
             return
         }
         do {
-            let resolved = try AssuanSocketRedirection.resolve(backendSocketPath)
-            let backend = try AssuanClient.connect(toSocket: resolved)
-            defer { backend.connection.close() }
+            // Decouple enclave signing from backend health (C1): try to (re)start
+            // and connect the backend, but if it stays down, serve with no backend
+            // so store keygrips keep signing. Only *forwarded* commands then fail,
+            // with a clean ERR, instead of the whole stack wedging.
+            let backendClient = connectBackend()
+            defer { backendClient?.connection.close() }
             let handler = SepProxyHandler(
-                keyStore: keyStore, authSession: authSession, backend: backend)
+                keyStore: keyStore, authSession: authSession,
+                backend: backendClient, peerProcessID: conn.peerProcessID)
             let server = AssuanServer(
-                client: conn, handler: handler, backend: backend.connection)
+                client: conn, handler: handler, backend: backendClient?.connection)
             try server.run()
         } catch {
             // A failed connection must never take the daemon down; just drop it.
             conn.close()
         }
+    }
+
+    /// Best-effort connection to the backend agent: ask ``BackendAgent`` to
+    /// ensure it is running (bounded restart), then connect. Returns nil if the
+    /// backend cannot be reached — the caller then serves in decoupled mode.
+    private func connectBackend() -> AssuanClient? {
+        backend.ensureRunning()
+        guard let socket = backend.socketPath,
+              let resolved = try? AssuanSocketRedirection.resolve(socket),
+              let client = try? AssuanClient.connect(toSocket: resolved) else {
+            return nil
+        }
+        return client
     }
 }
