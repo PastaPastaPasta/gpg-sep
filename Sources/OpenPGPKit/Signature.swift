@@ -129,6 +129,11 @@ public enum PGPSignatureTarget {
     case primaryKey(primary: PGPPublicKeyPacket)
     /// Document signature (0x00/0x01): the literal data being signed.
     case document(Data)
+    /// Precomputed target material — the exact bytes hashed before the
+    /// signature's own fields. Escape hatch for binding a subkey under a primary
+    /// this module does not model (e.g. an RSA YubiKey primary): the caller
+    /// supplies `<primary fingerprint preimage> || subkey.fingerprintPreimage`.
+    case raw(Data)
 
     /// The bytes hashed before the signature's own trailer.
     var preimage: Data {
@@ -141,6 +146,8 @@ public enum PGPSignatureTarget {
             return primary.fingerprintPreimage
         case let .document(data):
             return data
+        case let .raw(data):
+            return data
         }
     }
 }
@@ -152,6 +159,12 @@ public final class PGPSignatureBuilder {
     public let type: PGPSignatureType
     public let hashAlgorithm: PGPHashAlgorithm
     public let publicKeyAlgorithm: PGPPublicKeyAlgorithm
+    /// Raw algorithm octet of the *issuing* key as it appears in the signature's
+    /// hashed prefix (RFC 9580 §5.2.3): 19 for ECDSA, 18 for ECDH, 1 for RSA.
+    /// This is the authoritative value used when hashing and finalizing, and it
+    /// must match the key that actually produces the signature. For the
+    /// ECDSA/ECDH initializer it equals `publicKeyAlgorithm.rawValue`.
+    public let signingAlgorithmByte: UInt8
     public private(set) var hashedSubpackets: [PGPSubpacket] = []
     public private(set) var unhashedSubpackets: [PGPSubpacket] = []
 
@@ -166,6 +179,22 @@ public final class PGPSignatureBuilder {
         self.type = type
         self.hashAlgorithm = hashAlgorithm
         self.publicKeyAlgorithm = signingKeyAlgorithm
+        self.signingAlgorithmByte = signingKeyAlgorithm.rawValue
+    }
+
+    /// Initializer for issuing keys whose algorithm has no dedicated
+    /// `PGPPublicKeyAlgorithm` case in this minimal module — notably RSA (1) for
+    /// a YubiKey primary binding a Secure-Enclave subkey. `publicKeyAlgorithm` is
+    /// reported as `.ecdsa` and is NOT consulted on this path; only
+    /// `signingAlgorithmByte` is authoritative. Finalize with
+    /// ``finalizePacket(over:mpis:)`` (RSA → a single `s` MPI).
+    public init(type: PGPSignatureType,
+                hashAlgorithm: PGPHashAlgorithm,
+                signingAlgorithmByte: UInt8) {
+        self.type = type
+        self.hashAlgorithm = hashAlgorithm
+        self.publicKeyAlgorithm = .ecdsa
+        self.signingAlgorithmByte = signingAlgorithmByte
     }
 
     @discardableResult
@@ -180,7 +209,7 @@ public final class PGPSignatureBuilder {
     /// The fixed prefix of the signature body that is itself hashed: version,
     /// type, pk-algo, hash-algo, then the hashed-subpacket area.
     private func hashedSignatureData() -> Data {
-        var d = Data([0x04, type.rawValue, publicKeyAlgorithm.rawValue, hashAlgorithm.rawValue])
+        var d = Data([0x04, type.rawValue, signingAlgorithmByte, hashAlgorithm.rawValue])
         var sub = Data()
         for sp in hashedSubpackets { sub.append(sp.encoded()) }
         d.append(UInt8((sub.count >> 8) & 0xFF))
@@ -216,6 +245,26 @@ public final class PGPSignatureBuilder {
         guard !r.isEmpty, r.count <= 32, !s.isEmpty, s.count <= 32 else {
             throw OpenPGPError.invalidSignatureInteger
         }
+        // ECDSA signature: two MPIs, r then s.
+        return try finalizeBody(over: target, mpis: [r, s])
+    }
+
+    /// Assemble the full signature packet (tag 2, old-format header).
+    public func finalizePacket(over target: PGPSignatureTarget, r: Data, s: Data) throws -> Data {
+        let body = try finalizeBody(over: target, r: r, s: s)
+        var d = PacketHeader.oldFormat(tag: 2, bodyLength: body.count)
+        d.append(body)
+        return d
+    }
+
+    /// Assemble the signature packet body from an arbitrary list of big-endian
+    /// integers, each re-encoded as an OpenPGP MPI in order. ECDSA passes
+    /// `[r, s]`; RSA passes `[s]`. The 2-octet quick-check field is the leading
+    /// two octets of the digest.
+    public func finalizeBody(over target: PGPSignatureTarget, mpis: [Data]) throws -> Data {
+        guard !mpis.isEmpty, mpis.allSatisfy({ !$0.isEmpty }) else {
+            throw OpenPGPError.invalidSignatureInteger
+        }
         let sigData = hashedSignatureData()
         let digest = hashAlgorithm.digest(toBeHashed(over: target))
 
@@ -227,15 +276,13 @@ public final class PGPSignatureBuilder {
         body.append(unhashed)
         // Left 16 bits of the digest.
         body.append(digest.prefix(2))
-        // ECDSA signature: two MPIs, r then s.
-        body.append(MPI.encode(r))
-        body.append(MPI.encode(s))
+        for value in mpis { body.append(MPI.encode(value)) }
         return body
     }
 
-    /// Assemble the full signature packet (tag 2, old-format header).
-    public func finalizePacket(over target: PGPSignatureTarget, r: Data, s: Data) throws -> Data {
-        let body = try finalizeBody(over: target, r: r, s: s)
+    /// Assemble the full signature packet (tag 2) from arbitrary MPIs.
+    public func finalizePacket(over target: PGPSignatureTarget, mpis: [Data]) throws -> Data {
+        let body = try finalizeBody(over: target, mpis: mpis)
         var d = PacketHeader.oldFormat(tag: 2, bodyLength: body.count)
         d.append(body)
         return d

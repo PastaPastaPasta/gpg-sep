@@ -69,6 +69,16 @@ enum PacketHeader {
     }
 }
 
+/// The v4 fingerprint preimage `0x99 || len2(body) || body` (RFC 9580 §5.5.4)
+/// for an arbitrary public-key packet body — including RSA and other algorithms
+/// this module does not otherwise model. `SHA-1` over this yields the 20-byte
+/// fingerprint; the same bytes bind the key inside subkey-binding signatures.
+public func v4FingerprintPreimage(publicKeyBody body: Data) -> Data {
+    var d = Data([0x99, UInt8((body.count >> 8) & 0xFF), UInt8(body.count & 0xFF)])
+    d.append(body)
+    return d
+}
+
 /// A v4 public-key or public-subkey packet (tag 6 / tag 14) for a nistp256
 /// ECDSA or ECDH key.
 public struct PGPPublicKeyPacket: Equatable {
@@ -120,10 +130,7 @@ public struct PGPPublicKeyPacket: Equatable {
     /// The data hashed to form a fingerprint and to bind this key in
     /// signatures: `0x99 || len2(body) || body` (RFC 9580 §5.5.4).
     public var fingerprintPreimage: Data {
-        let body = bodyData()
-        var d = Data([0x99, UInt8((body.count >> 8) & 0xFF), UInt8(body.count & 0xFF)])
-        d.append(body)
-        return d
+        v4FingerprintPreimage(publicKeyBody: bodyData())
     }
 
     /// 20-byte v4 fingerprint: SHA-1 over the fingerprint preimage.

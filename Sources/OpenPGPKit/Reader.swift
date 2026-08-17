@@ -20,9 +20,57 @@ public struct ParsedSignature {
     public let mpis: [Data]     // r, s for ECDSA
 }
 
+/// A raw, uninterpreted packet: its tag plus the body bytes and the full
+/// on-wire packet bytes (header + body). Lets callers handle packet kinds this
+/// module does not model — notably an RSA (algo 1) primary key packet whose body
+/// layout differs from the ECDSA/ECDH keys the typed reader understands.
+public struct PGPRawPacket {
+    public let tag: UInt8
+    public let body: Data
+    public let packet: Data
+}
+
+/// Walk a packet stream returning every packet's tag and raw bytes without
+/// interpreting the bodies. Handles both old- and new-format headers.
+public enum PGPPacketScanner {
+    public static func scan(_ data: Data) throws -> [PGPRawPacket] {
+        var packets: [PGPRawPacket] = []
+        var i = data.startIndex
+        while i < data.endIndex {
+            let packetStart = i
+            let ctb = data[i]
+            guard ctb & 0x80 != 0 else { throw OpenPGPError.malformedPacket("bad CTB \(ctb)") }
+            var tag: UInt8
+            var length: Int
+            i = data.index(after: i)
+            if ctb & 0x40 != 0 {
+                tag = ctb & 0x3F
+                (length, i) = try PGPReader.scanNewLength(data, i)
+            } else {
+                tag = (ctb >> 2) & 0x0F
+                let lenType = ctb & 0x03
+                (length, i) = try PGPReader.scanOldLength(data, i, lenType: lenType)
+            }
+            guard data.distance(from: i, to: data.endIndex) >= length else { throw OpenPGPError.truncated }
+            let body = data.subdata(in: i..<data.index(i, offsetBy: length))
+            i = data.index(i, offsetBy: length)
+            let packet = data.subdata(in: packetStart..<i)
+            packets.append(PGPRawPacket(tag: tag, body: body, packet: packet))
+        }
+        return packets
+    }
+}
+
 /// Minimal packet reader covering the packet kinds this module emits. Handles
 /// both old- and new-format headers.
 public enum PGPReader {
+    static func scanOldLength(_ data: Data, _ i: Data.Index, lenType: UInt8) throws -> (Int, Data.Index) {
+        try readOldLength(data, i, lenType: lenType)
+    }
+    static func scanNewLength(_ data: Data, _ i: Data.Index) throws -> (Int, Data.Index) {
+        try readNewLength(data, i)
+    }
+
     public static func parse(_ data: Data) throws -> [PGPPacket] {
         var packets: [PGPPacket] = []
         var i = data.startIndex
